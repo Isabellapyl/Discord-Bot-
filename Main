@@ -1,0 +1,199 @@
+# Import the required libraries
+import discord  # importing the knock off discord
+from discord.ext import commands  # importing commands from the knock discord
+import google.generativeai as genai  # importing generative AI from Google
+import re  # importing regex for pattern matching
+import os  # To securely handle environment variables
+
+# Insert the discord token and API key
+DISCORD_TOKEN = "Inset TOken"
+API_KEY = "Insert API key"
+
+# Configure the API key for the AI
+genai.configure(api_key=API_KEY)
+
+# Set up intents for the Discord bot
+intents = discord.Intents.default()  # set up default intents for the bot
+intents.message_content = True  # allow the bot to read message content so it can respond to users answers
+
+# Initialize the bot with intents
+bot = commands.Bot(command_prefix="!", intents=intents)  # set up the bot with prefix and intents
+
+# Set to keep track of already asked trivia questions
+asked_questions = set()
+
+# Dictionary to track user scores and correct/incorrect guesses
+user_scores = {}
+user_guesses = {}
+
+# Function to handle errors and send a response to the user
+async def handle_error(ctx, error_message):
+    await ctx.send(f"An error occurred: {error_message}")
+
+# Function to generate a unique trivia question and answers
+def generate_trivia_question():
+    try:
+        # Load the model and start a chat session
+        model = genai.GenerativeModel("models/gemini-1.5-flash")
+        chat = model.start_chat()  # start a chat session with the model
+
+        # Generate a trivia question with options and the correct answer
+        while True:
+            question_response = chat.send_message(
+                """
+                Generate a unique trivia question with four possible answers. Format it as follows:
+                'Question: [Your Trivia Question Here]'
+                '1. [Option 1]'
+                '2. [Option 2]'
+                '3. [Option 3]'
+                '4. [Option 4]'
+                Also, specify the correct answer number at the end in the format 'Answer: [Correct Option Number]'.
+                """
+            )
+
+            # Check if there's a response and validate format
+            if question_response and question_response.text:
+                lines = question_response.text.split('\n')  # split the response into lines
+
+                # Extract question, options, and answer
+                question = next((line for line in lines if line.lower().startswith("question:")), None)  # extract the question
+                options = [line for line in lines if re.match(r'^\d\.\s', line)]  # extract options using regex
+                answer_line = next((line for line in lines if line.lower().startswith("answer:")), None)  # extract answer line
+
+                if question and len(options) == 4 and answer_line:
+                    try:
+                        correct_answer = int(answer_line.split(": ")[1])  # extract correct answer number
+                    except ValueError:
+                        return "Error parsing the correct answer.", [], None
+
+                    # Check if question is unique
+                    if question not in asked_questions:
+                        asked_questions.add(question)  # add the new question to the set to avoid repeats
+                        return question, options, correct_answer  # return question, options, and correct answer
+
+        # If format is unexpected, return an error message
+        return "The response isn't in the right format.", [], None  # handle unexpected format
+
+    except Exception as e:
+        return f"Error generating question: {str(e)}", [], None  # handle exceptions and return error message
+
+# Function to start a chat session with the Gemini API based on user input
+def generate_story_and_choices(setting):
+    try:
+        # Load the model and start a chat session
+        model = genai.GenerativeModel("models/gemini-1.5-flash")  # Specify the model name correctly
+        chat = model.start_chat()  # Start the chat session
+
+        # Generate the initial story snippet with embedded choices
+        story_response = chat.send_message(
+            f"Generate the beginning snippet of a CHILD APPROPRIATE story. This is the start of a choose-your-own-adventure game. The setting is: {setting}. "
+            "Provide a short story introduction, followed by two distinct choices that the user can choose from to continue the story. "
+            "Format them as:\n'1. [First Choice]'\n'2. [Second Choice]'."
+        )
+        story_text = story_response.text if story_response else "No response generated."
+
+        return story_text, chat
+
+    except Exception as e:
+        return f"Error generating story or choices: {str(e)}", None
+
+# Combined function to await user input
+def create_check(ctx):
+    return lambda m: m.author == ctx.author and m.channel == ctx.channel
+
+# Start game command
+@bot.command(name="story")  # define the "story" command for the bot
+async def start_game(ctx):
+    try:
+        # Bot asks about the setting
+        await ctx.send("Where do you want your story to take place?")
+
+        # Wait for user's response
+        user_response = await bot.wait_for("message", check=create_check(ctx))
+        setting = user_response.content
+
+        # Generate the beginning of the story and choices based on the user-provided setting
+        story_snippet, chat_session = generate_story_and_choices(setting)
+        await ctx.send(f"Here’s the start of your adventure:\n\n{story_snippet.strip()}")
+
+        # Loop for continued story progression until it concludes
+        story_complete = False
+        while not story_complete:
+            # Prompt for the user's choice
+            await ctx.send("Please respond with '1' or '2' to make your choice.")
+
+            # Check for a valid response
+            user_choice = await bot.wait_for("message", check=lambda m: create_check(ctx)(m) and m.content in ["1", "2"])
+
+            # Process the user's choice and send a continuation of the story based on the choice
+            continuation_response = chat_session.send_message(
+                f"The user chose option {user_choice.content}. Continue the story based on this choice. "
+                "Provide a brief story continuation, and two new choices formatted as:\n'1. [First Choice]'\n'2. [Second Choice]'. "
+                "End the story if a logical conclusion is reached."
+            )
+            continuation_text = continuation_response.text if continuation_response else "No continuation generated."
+
+            # Check for a logical conclusion
+            if any(keyword in continuation_text.lower() for keyword in
+                   ["you find the treasure", "you escape", "you solve the problem", "the end", "the story concludes"]):
+                story_complete = True
+
+            await ctx.send(continuation_text)
+
+        await ctx.send("Congratulations! You’ve reached the end of your adventure. Thanks for playing!")
+    except Exception as e:
+        await handle_error(ctx, str(e))
+
+# Trivia command
+@bot.command(name="trivia")  # define the "trivia" command for the bot
+async def trivia(ctx):
+    try:
+        # Generate a trivia question
+        question, options, correct_answer = generate_trivia_question()
+        if correct_answer is None:
+            await ctx.send(question)
+            return
+
+        # Display the trivia question and options
+        await ctx.send(f"{question}\n" + "\n".join(options))
+
+        # Wait for the user to respond with a choice
+        user_response = await bot.wait_for("message", check=lambda m: create_check(ctx)(m) and m.content in ["1", "2", "3", "4"])
+        user_choice = int(user_response.content)
+
+        # Check if the answer is correct
+        is_correct = user_choice == correct_answer
+        user_scores[ctx.author.id] = user_scores.get(ctx.author.id, 0) + (1 if is_correct else 0)
+        user_guesses[ctx.author.id] = user_guesses.get(ctx.author.id, {'correct': 0, 'incorrect': 0})
+        user_guesses[ctx.author.id]['correct' if is_correct else 'incorrect'] += 1
+
+        await ctx.send(f"\U0001F389 Correct! Well done!" if is_correct else f"\u274C Incorrect. The correct answer was option {correct_answer}.")
+
+        # Display the user's score and ratio
+        correct_guesses = user_guesses[ctx.author.id]['correct']
+        incorrect_guesses = user_guesses[ctx.author.id]['incorrect']
+        total_guesses = correct_guesses + incorrect_guesses
+        ratio = correct_guesses / total_guesses if total_guesses > 0 else 0
+        await ctx.send(f"Your current score is: {user_scores.get(ctx.author.id, 0)}")
+        await ctx.send(f"Your correct-to-wrong ratio is: {correct_guesses} correct / {incorrect_guesses} incorrect (Ratio: {ratio:.2f})")
+        await ctx.send("Want to do more trivia? Type !trivia to play again!")
+    except Exception as e:
+        await handle_error(ctx, str(e))
+
+# Reset command to reset the user's score and ratio
+@bot.command(name="reset")
+async def reset_score(ctx):
+    try:
+        # Reset user's score and guesses
+        user_scores[ctx.author.id] = 0
+        user_guesses[ctx.author.id] = {'correct': 0, 'incorrect': 0}
+        await ctx.send("Your score and ratio have been reset to 0. Type !trivia to play again.")
+    except Exception as e:
+        await handle_error(ctx, str(e))
+
+# Run the bot
+try:
+    bot.run(DISCORD_TOKEN)  # run the bot with the Discord token that was initialized at the beginning
+except Exception as e:
+    print(f"Failed to run the bot: {str(e)}")
+
